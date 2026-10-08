@@ -1,0 +1,147 @@
+name: CELLFLOW Unified Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version, e.g. 1.0.0
+        required: true
+        default: 1.0.0
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: android-actions/setup-android@v3
+      - name: Prepare Android
+        working-directory: mobile
+        run: |
+          npm install
+          npx cap add android
+          npx cap sync android
+      - name: Configure Android signing (optional)
+        working-directory: mobile
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+        run: |
+          if [[ -n "$ANDROID_KEYSTORE_BASE64" && -n "$ANDROID_KEY_ALIAS" && -n "$ANDROID_KEY_PASSWORD" && -n "$ANDROID_STORE_PASSWORD" ]]; then
+            echo "$ANDROID_KEYSTORE_BASE64" | base64 --decode > android/release-key.jks
+            printf "storeFile=release-key.jks\nstorePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n" "$ANDROID_STORE_PASSWORD" "$ANDROID_KEY_ALIAS" "$ANDROID_KEY_PASSWORD" > android/keystore.properties
+            python3 configure-android-signing.py
+            test -s android/release-key.jks
+            echo 'Android signing configured.'
+            echo 'CELLFLOW_SIGNING_STATUS=SIGNED' >> "$GITHUB_ENV"
+          else
+            echo 'Android signing secrets not configured; producing unsigned release APK.'
+            echo 'CELLFLOW_SIGNING_STATUS=UNSIGNED' >> "$GITHUB_ENV"
+          fi
+
+      - name: Build release APK
+        working-directory: mobile/android
+        run: ./gradlew assembleRelease
+      - name: Check APK exists
+        run: test -s mobile/android/app/build/outputs/apk/release/*.apk
+      - name: Record Android signing status
+        shell: bash
+        run: echo "${CELLFLOW_SIGNING_STATUS:-UNKNOWN}" > mobile/android/app/build/outputs/apk/release/SIGNING_STATUS.txt
+      - name: Checksum APK
+        shell: bash
+        run: sha256sum mobile/android/app/build/outputs/apk/release/*.apk > mobile/android/app/build/outputs/apk/release/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cellflow-android-release-unified
+          path: |
+            mobile/android/app/build/outputs/apk/release/*.apk
+            mobile/android/app/build/outputs/apk/release/SHA256SUMS.txt
+            mobile/android/app/build/outputs/apk/release/SIGNING_STATUS.txt
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: windows/package.json
+      - name: Install Windows dependencies
+        working-directory: windows
+        run: npm install
+      - name: Prepare packaged web assets
+        run: node windows/prepare-release.js
+      - name: Verify packaged entrypoint
+        shell: pwsh
+        run: |
+          if (!(Test-Path windows/web/index.html)) { throw 'Missing windows/web/index.html' }
+          $main = Get-Content windows/main.js -Raw
+          if ($main -notmatch '__dirname.*web.*index\.html') { throw 'Entrypoint is not package-relative' }
+      - name: Build installer and portable EXE
+        working-directory: windows
+        run: npm run dist
+      - name: Check EXE exists
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem windows/dist -Filter *.exe
+          if ($files.Count -lt 1) { throw 'No Windows EXE generated' }
+      - name: Checksum Windows artifacts
+        shell: pwsh
+        run: |
+          Get-ChildItem windows/dist -Filter *.exe | Get-FileHash -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $($_.Name)" } | Set-Content windows/dist/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cellflow-windows-release-unified
+          path: |
+            windows/dist/*.exe
+            windows/dist/SHA256SUMS.txt
+          if-no-files-found: error
+
+  publish:
+    needs: [android, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: cellflow-android-release-unified
+          path: release/android
+      - uses: actions/download-artifact@v4
+        with:
+          name: cellflow-windows-release-unified
+          path: release/windows
+      - name: Create release manifest
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          [ "$VERSION" = "$GITHUB_REF_NAME" ] && VERSION="${{ inputs.version }}"
+          export CELLFLOW_SIGNING_STATUS="$(cat release/android/SIGNING_STATUS.txt 2>/dev/null || echo UNKNOWN)"
+          CELLFLOW_VERSION="$VERSION" bash ops/release-manifest.sh release/CELLFLOW_RELEASE_MANIFEST.txt
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            TAG="$GITHUB_REF_NAME"
+          else
+            TAG="v${{ inputs.version }}"
+          fi
+          gh release create "$TAG" release/android/* release/windows/* release/CELLFLOW_RELEASE_MANIFEST.txt \
+            --title "CELLFLOW $TAG" \
+            --generate-notes
